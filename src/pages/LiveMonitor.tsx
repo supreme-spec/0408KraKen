@@ -372,6 +372,17 @@ export default function LiveMonitor({
   useEffect(() => { onLatestFaceRef.current = onLatestFace }, [onLatestFace])
   const [detectedFace, setDetectedFace] = useState<FaceDetection | null>(null)
   const [detectedPerson, setDetectedPerson] = useState<Person | null>(null)
+  const [recognitionThreshold, setRecognitionThreshold] = useState<number>(0.6)
+
+  useEffect(() => {
+    apiFetch<any>('/settings/')
+      .then(s => {
+        if (s?.verification_threshold_pct != null) {
+          setRecognitionThreshold(s.verification_threshold_pct / 100)
+        }
+      })
+      .catch(() => {})
+  }, [])
 
   const handleFaceDetected = useCallback((face: FaceDetection) => {
     if (face.track_id === -1) {
@@ -790,6 +801,8 @@ export default function LiveMonitor({
               person={detectedPerson}
               confidence={detectedFace?.confidence}
               cameraName={cameras.find(c => c.id === selectedCameraId)?.name}
+              threshold={recognitionThreshold}
+              onPhoto={detectedFace?.photo_path ?? null}
             />
           </DraggableBlock>
         )}
@@ -934,7 +947,11 @@ function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: 
         <div className="flex gap-2">
           <div className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
             <div className="text-kraken-disabled text-[9px] text-center py-1 border-b border-kraken-border">Сейчас</div>
-            <img src={`data:image/jpeg;base64,${onPhoto}`} alt="current" className="w-full h-20 object-cover" />
+            <img 
+              src={onPhoto.startsWith('data:image') ? onPhoto : `${PHOTO_BASE}/${onPhoto}`} 
+              alt="current" 
+              className="w-full h-20 object-cover" 
+            />
           </div>
           {person.photo_path && (
             <div className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
