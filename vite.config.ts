@@ -16,10 +16,22 @@ export default defineConfig(() => {
     server: {
       host: '0.0.0.0',
       hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {
-        // Игнорируем постоянно меняющиеся логи/билды, чтобы не дёргать HMR лишний раз
-        ignored: ['**/logs/**', '**/node_modules/**', '**/.git/**', '**/dist/**'],
-      },
+       watch: process.env.DISABLE_HMR === 'true' ? null : {
+         // Игнорируем постоянно меняющиеся логи/билды, чтобы не дёргать HMR лишний раз
+         ignored: [
+           '**/logs/**',
+           '**/node_modules/**',
+           '**/.git/**',
+           '**/dist/**',
+           '**/venv/**',
+           '**/venv_kraken/**',
+           '**/venv_new/**',
+           '**/calibration/**',
+           '**/backend/**',
+           '**/assets/**',
+           '**/models/**',
+         ],
+       },
       proxy: {
         '/api': {
           target: 'http://localhost:3000',
