@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import traceback
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -171,7 +172,7 @@ class AIManager:
 
             logger.info(f"Initializing detector: {name}")
 
-            await instance.initialize()
+            await asyncio.to_thread(instance.initialize)
 
             self._detector_instances[name] = instance
             self._active_detector_name = name
@@ -220,7 +221,7 @@ class AIManager:
 
             recognizer_class = self._recognizer_classes[name]
             instance = recognizer_class()
-            await instance.initialize()
+            await asyncio.to_thread(instance.initialize)
 
             self._recognizer_instances[name] = instance
             self._active_recognizer_name = name
@@ -264,7 +265,7 @@ class AIManager:
 
             tracker_class = self._tracker_classes[name]
             instance = tracker_class()
-            await instance.initialize()
+            await asyncio.to_thread(instance.initialize)
 
             self._tracker_instances[name] = instance
             self._active_tracker_name = name
@@ -325,7 +326,7 @@ class AIManager:
             return []
 
         try:
-            return await detector.detect_with_embedding(image_bytes)
+            return await asyncio.to_thread(detector.detect_with_embedding, image_bytes)
         except Exception as e:
             logger = logging.getLogger(__name__)
             logger.error(f"Detector {name} failed: {e}")
@@ -338,7 +339,7 @@ class AIManager:
         if not recognizer:
             return {'error': 'No recognizer loaded'}
 
-        embedding = await recognizer.extract_embedding(face_image)
+        embedding = await asyncio.to_thread(recognizer.extract_embedding, face_image)
         if not embedding:
             return {'error': 'Failed to extract embedding'}
 

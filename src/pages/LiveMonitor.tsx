@@ -836,21 +836,35 @@ export default function LiveMonitor({
 
 // ── LastGuestBlock ────────────────────────────────────────────────────────────
 
-function LastGuestBlock({ person, confidence, cameraName }: {
+function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: {
   person: Person | null
   confidence?: number
   cameraName?: string
+  threshold?: number
+  onPhoto?: string | null
 }) {
   const [loyalty, setLoyalty] = useState<any>(null)
   const [personDetails, setPersonDetails] = useState<Person | null>(null)
+  const [categoryAlert, setCategoryAlert] = useState<string | null>(null)
+  const prevCategoryRef = useRef<string | null>(null)
 
   useEffect(() => {
-    if (!person?.id) { setLoyalty(null); setPersonDetails(null); return }
+    if (!person?.id) { setLoyalty(null); setPersonDetails(null); setCategoryAlert(null); prevCategoryRef.current = null; return }
     apiFetch<any>(`/loyalty/${person.id}`)
       .then(r => setLoyalty(r.loyalty))
       .catch(() => {})
     apiFetch<Person>(`/persons/${person.id}`)
-      .then(p => setPersonDetails(p))
+      .then(p => {
+        setPersonDetails(p)
+        // Detect category change
+        const prevCat = prevCategoryRef.current
+        const currCat = p.category
+        if (prevCat && prevCat !== currCat) {
+          setCategoryAlert(`Категория изменена: ${prevCat} → ${currCat}`)
+          setTimeout(() => setCategoryAlert(null), 8000)
+        }
+        prevCategoryRef.current = currCat
+      })
       .catch(() => setPersonDetails(null))
   }, [person?.id])
 
@@ -884,6 +898,13 @@ function LastGuestBlock({ person, confidence, cameraName }: {
 
   return (
     <div className="h-full flex flex-col overflow-y-auto p-3 gap-3">
+      {/* Category alert */}
+      {categoryAlert && (
+        <div className="bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs px-3 py-2 rounded-lg text-center">
+          ⚠ {categoryAlert}
+        </div>
+      )}
+
       {/* Фото + имя */}
       <div className="flex items-center gap-3">
         <div className="w-24 h-24 rounded-xl overflow-hidden bg-kraken-hover border-2 flex-shrink-0"
@@ -901,9 +922,28 @@ function LastGuestBlock({ person, confidence, cameraName }: {
           <div className="flex flex-col items-end flex-shrink-0">
             <span className="text-xl font-black" style={{ color: confColor }}>{pct}%</span>
             <span className="text-kraken-disabled text-[9px]">совпадение</span>
+            {threshold != null && (
+              <span className="text-[8px] text-kraken-muted">порог: {(threshold * 100).toFixed(0)}%</span>
+            )}
           </div>
         )}
       </div>
+
+      {/* До/После фото */}
+      {onPhoto && (
+        <div className="flex gap-2">
+          <div className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
+            <div className="text-kraken-disabled text-[9px] text-center py-1 border-b border-kraken-border">Сейчас</div>
+            <img src={`data:image/jpeg;base64,${onPhoto}`} alt="current" className="w-full h-20 object-cover" />
+          </div>
+          {person.photo_path && (
+            <div className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
+              <div className="text-kraken-disabled text-[9px] text-center py-1 border-b border-kraken-border">Профиль</div>
+              <img src={`${PHOTO_BASE}/${person.photo_path}`} alt="profile" className="w-full h-20 object-cover" />
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Прогресс совпадения */}
       {pct != null && (

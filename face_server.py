@@ -195,6 +195,9 @@ cooldown_lock = threading.Lock()
 _frame_counter = 0
 frame_lock = threading.Lock()
 
+_is_index_dirty = False
+_last_indexed_count = 0
+
 
 # ─── Security Middleware ──────────────────────────────────────────────────────
 
@@ -377,8 +380,22 @@ async def search_faiss_async(query_vector: np.ndarray, top_k: int = 5) -> List[D
 
 
 async def rebuild_faiss_index_async(descriptors: List[Dict[str, Any]]) -> None:
-    """Rebuilds the FAISS index via the serial executor. Thread-safe."""
+    """Rebuilds the FAISS index via the serial executor. Thread-safe.
+
+    Skips rebuild if the index already has the same number of vectors
+    and is not marked dirty.
+    """
+    global _is_index_dirty, _last_indexed_count
+
+    current_count = len(descriptors)
+    if not _is_index_dirty and current_count == _last_indexed_count and faiss_index is not None:
+        logger.info(f"FAISS index already up-to-date ({current_count} vectors), skipping rebuild.")
+        return
+
+    logger.info(f"Rebuilding FAISS index: {current_count} descriptors (dirty={_is_index_dirty})")
     await faiss_executor.submit(_build_faiss_index, descriptors)
+    _last_indexed_count = current_count
+    _is_index_dirty = False
 
 
 def get_faiss_ntotal() -> int:
@@ -1765,6 +1782,7 @@ async def recognize(
             "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": get_faiss_ntotal(),
             "best_similarity": best_sim,
+            "threshold": effective_threshold,
             "gender": ("male" if getattr(primary_face, "gender", None) == 0 else "female") if hasattr(primary_face, "gender") and primary_face.gender is not None else None,
             "age": int(primary_face.age) if hasattr(primary_face, "age") and primary_face.age is not None else None,
         }
@@ -1863,6 +1881,7 @@ async def recognize_by_descriptor(
             "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": get_faiss_ntotal(),
             "best_similarity": best_sim,
+            "threshold": effective_threshold,
         }
 
         if needs_confirmation_data and not matches:

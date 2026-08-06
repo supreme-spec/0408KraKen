@@ -2274,6 +2274,10 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     }
     
     const destPath = path.join(tempFolder, file.originalname);
+    if (!file.buffer) {
+      logWarn(`[Bulk Import] Empty buffer for file ${file.originalname}, skipping`);
+      continue;
+    }
     fs.writeFileSync(destPath, file.buffer);
   }
 

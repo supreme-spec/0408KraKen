@@ -817,31 +817,40 @@ async function recognizeDescriptorOnServer(
   }
 }
 
+let _faissSyncTimer: ReturnType<typeof setTimeout> | null = null
+const FAISS_SYNC_DEBOUNCE_MS = 3000
+
 async function syncIndexWithPython(): Promise<void> {
-  try {
-    const persons = storedDescriptors.map((d) => ({
-      person_id: d.personId,
-      person_name: d.personName,
-      category: d.category,
-      photo_path: d.photoPath,
-      descriptor: Array.from(d.descriptor),
-    }));
-
-    const response = await apiFetchWithKey(`${FACE_SERVER_URL}/update-index`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ persons }),
-    });
-
-    if (!response.ok) {
-      logWarn(`Python index sync failed: ${response.status}`);
-    } else {
-      const result = await response.json() as { indexed?: number };
-      logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`);
-    }
-  } catch (e) {
-    logError(e as Error, { context: "Синхронизация индекса с Python" });
+  if (_faissSyncTimer) {
+    clearTimeout(_faissSyncTimer)
   }
+  _faissSyncTimer = setTimeout(async () => {
+    _faissSyncTimer = null
+    try {
+      const persons = storedDescriptors.map((d) => ({
+        person_id: d.personId,
+        person_name: d.personName,
+        category: d.category,
+        photo_path: d.photoPath,
+        descriptor: Array.from(d.descriptor),
+      }))
+
+      const response = await apiFetchWithKey(`${FACE_SERVER_URL}/update-index`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ persons }),
+      })
+
+      if (!response.ok) {
+        logWarn(`Python index sync failed: ${response.status}`)
+      } else {
+        const result = await response.json() as { indexed?: number }
+        logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`)
+      }
+    } catch (e) {
+      logError(e as Error, { context: "Синхронизация индекса с Python" })
+    }
+}, FAISS_SYNC_DEBOUNCE_MS)
 }
 
 // ─── ОСНОВНЫЕ ФУНКЦИИ ────────────────────────────────────────────────────────
