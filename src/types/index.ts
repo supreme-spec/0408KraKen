@@ -107,6 +107,7 @@ export interface KrakenEvent {
   person_id?: number
   event_type: 'RECOGNIZED' | 'UNKNOWN' | 'BLACKLIST_ALERT' | 'VIP_ARRIVAL' | 'RESPONSE_ALERT'
   confidence?: number
+  threshold?: number
   snapshot_path?: string | null
   person_name?: string
   person_category?: Category
@@ -147,6 +148,7 @@ export interface AlertMessage {
   camera_id: number
   doorName?: string
   confidence: number
+  threshold?: number
   snapshot_path?: string
   photo_path?: string
   message?: string

@@ -2316,7 +2316,7 @@ app.post(["/api/persons/bulk_delete", "/api/persons/bulk_delete/"], async (req, 
 
 const importJobs: Record<string, any> = {};
 
-app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any(), async (req, res) => {
+async function runBulkImport(req: express.Request, res: express.Response) {
   let files: Express.Multer.File[] = [];
   if (req.file) {
     files.push(req.file);
@@ -2325,7 +2325,6 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     files = files.concat(req.files as Express.Multer.File[]);
   }
 
-  // Фикс кракозябр: браузер передаёт originalname в latin1, не UTF-8
   fixFilesEncoding(files);
   if (req.body && typeof req.body === 'object') {
     for (const key of Object.keys(req.body)) {
@@ -2342,18 +2341,14 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     return res.status(400).json({ error: 'No files uploaded' });
   }
 
-  // 1. Создаём временную папку для загрузки
   const tempFolder = path.join(os.tmpdir(), `intake_${Date.now()}_${Math.floor(Math.random() * 1000)}`);
   fs.mkdirSync(tempFolder, { recursive: true });
 
-  // 2. Сохраняем все файлы во временную папку и извлекаем имя
   let personName = req.body.person_name || `Unknown_${Date.now()}`;
   
   for (const file of files) {
-    // Пытаемся извлечь имя из первого файла, если person_name не передан явно
     if (!req.body.person_name && file.originalname) {
       const baseName = path.parse(file.originalname).name;
-      // Эвристика: "Иванов Иван - Директор.jpg" -> "Иванов Иван"
       const match = baseName.match(/^([А-Яа-яЁё\s\-]+?)(?:\s*[-–]\s*.+)?$/);
       if (match) {
         personName = normalizePersonName(match[1].trim());
@@ -2368,16 +2363,13 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     fs.writeFileSync(destPath, file.buffer);
   }
 
-  // 3. Сохраняем статус задачи в памяти
   importJobs[jobId] = { status: 'pending', progress: 0, total: files.length };
   res.json({ job_id: jobId, message: 'Import started' });
 
-  // Создаём outputDir для сохранения кропов
   const safePersonName = personName.replace(/\s+/g, '_');
   const outputDir = path.join(publicDir, 'photos', 'intake', safePersonName);
   fs.mkdirSync(outputDir, { recursive: true });
 
-  // 4. Асинхронная обработка
   setTimeout(async () => {
     const job = importJobs[jobId];
     if (!job) return;
@@ -2386,13 +2378,11 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     job.warnings = [];
     
     try {
-      // Создаём FormData
       const form = new FormData();
       form.append('folder', tempFolder);
       form.append('person_name', personName);
       form.append('output_dir', outputDir);
       
-      // Вызов Python intake
       const intakeRes = await fetch(`${process.env.PYTHON_INTAKE_URL || 'http://localhost:8001'}/intake`, {
         method: 'POST',
         body: form as any,
@@ -2409,7 +2399,6 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
       let failedCount = 0;
       const createdList: any[] = [];
       
-      // Проверка похожих имён для предупреждения о дубликатах
       const existingAll = await prisma.person.findMany({ select: { name: true } });
       const existingNames = existingAll.map(p => p.name);
       const similarNames = findSimilarNames(personName, existingNames, 0.85);
@@ -2420,7 +2409,6 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
         });
       }
       
-      // 5. Обработка отчёта и запись в БД
       for (const item of intakeResult.report || []) {
         if (item.status === 'passed' && item.embedding && item.output_path) {
           try {
@@ -2505,7 +2493,6 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
         }
       }
       
-      // 6. Обновляем статус задачи
       job.status = 'completed';
       job.progress = files.length;
       job.created = createdList;
@@ -2518,7 +2505,6 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
         duplicates_skipped: intakeResult.photos_duplicate || 0
       };
       
-      // 7. Очистка временной папки
       try {
         fs.rmSync(tempFolder, { recursive: true, force: true });
       } catch (e: any) {
@@ -2531,7 +2517,6 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
       job.error = error.message;
       job.failed = [{ file: 'batch', error: error.message }];
       
-      // Очистка временной папки
       try {
         fs.rmSync(tempFolder, { recursive: true, force: true });
       } catch (e: any) {
@@ -2539,33 +2524,14 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
       }
     }
   }, 100);
+}
+
+app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any(), async (req, res) => {
+  await runBulkImport(req, res);
 });
 
-app.get(["/api/persons/bulk_import/:job_id", "/api/persons/bulk_import/:job_id/"], (req, res) => {
-  const { job_id } = req.params;
-  const job = importJobs[job_id];
-  if (job) {
-    res.json(job);
-  } else {
-    res.status(404).json({ detail: "Job not found" });
-  }
-});
-
-// Alias for SmartImportModal compatibility
 app.post(["/api/persons/smart_import", "/api/persons/smart_import/"], upload.any(), async (req, res) => {
-  logInfo("[Smart Import] Alias called, redirecting to bulk_import logic");
-  req.url = "/api/persons/bulk_import";
-  const bulkHandler = (app as any)._router?.stack?.find((layer: any) => {
-    const route = layer.route;
-    if (!route) return false;
-    const path = (route.path || '').toString();
-    return path.includes('bulk_import') && route.methods?.post;
-  });
-
-  if (bulkHandler && bulkHandler.route && bulkHandler.route.stack && bulkHandler.route.stack[0]) {
-    return bulkHandler.route.stack[0].handle(req, res);
-  }
-  res.status(500).json({ detail: "bulk_import handler not found" });
+  await runBulkImport(req, res);
 });
 
 // Photo upload to person
@@ -4877,7 +4843,7 @@ const SLOT_ROTATION_INTERVAL_MS = parseInt(process.env.SLOT_ROTATION_INTERVAL_MS
 // ── Атомарный менеджер слотов (предотвращает race conditions) ──
 const streamSlots = {
   count: 0,
-  holders: new Set<number>(),
+  holders: new Set<number>() as Set<number>,
 
   tryAcquire(cameraId: number): boolean {
     if (this.holders.has(cameraId)) return true;
@@ -4896,11 +4862,11 @@ const streamSlots = {
     return true;
   },
 
-  getOldestHolder(): number | null {
-    const holders = Array.from(this.holders);
-    if (holders.length === 0) return null;
-    return holders[0];
-  },
+getOldestHolder(): number | null {
+     const holders = Array.from(this.holders) as number[];
+     if (holders.length === 0) return null;
+     return holders[0];
+   },
 
   isHolder(cameraId: number): boolean {
     return this.holders.has(cameraId);
@@ -6778,6 +6744,7 @@ async function start() {
 
   server.listen(PORT, HOST, () => {
     logInfo(`Server running on http://${HOST}:${PORT}`);
+    startSlotRotation();
   });
 }
 

@@ -191,6 +191,7 @@ model Event {
   guest_id                    Int?
   event_type                  String
   confidence                  Float
+  threshold                   Float?
   snapshot_path               String?
   person_name                 String?
   person_category             String?
