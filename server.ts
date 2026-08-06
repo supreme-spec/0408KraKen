@@ -472,11 +472,98 @@ function sanitizeCamera(cam: any): any {
 app.get(["/api/cameras", "/api/cameras/"], async (req, res) => {
   try {
     const camsFromDB = await prisma.camera.findMany({ orderBy: { id: "asc" } });
-    // Sync in-memory array for WebSocket & FFmpeg use
     cameras = camsFromDB.map((c: any) => ({ ...decryptCameraCreds(c), status: c.status || "offline" }));
     res.json(cameras.map(sanitizeCamera));
   } catch (err) {
     logError(err as Error, { path: "/api/cameras", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+app.get(["/api/cameras/:id", "/api/cameras/:id/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ detail: "Invalid camera ID" });
+    }
+
+    const cam = await prisma.camera.findUnique({
+      where: { id },
+      include: {
+        events: {
+          orderBy: { created_at: "desc" },
+          take: 5,
+          select: {
+            id: true,
+            event_type: true,
+            person_name: true,
+            confidence: true,
+            created_at: true,
+          }
+        }
+      }
+    });
+
+    if (!cam) {
+      return res.status(404).json({ detail: "Camera not found" });
+    }
+
+    const memoryCam = cameras.find(c => c.id === id);
+    res.json({
+      ...sanitizeCamera(cam),
+      status: memoryCam?.status || cam.status || "offline",
+      is_active: memoryCam?.is_active ?? cam.is_active,
+      pipeline_status: cameraStreams.has(id) ? "streaming" : "idle",
+      recent_events_count: cam.events?.length || 0,
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+// ── Stream Concurrency Status Endpoint ──
+app.get(["/api/streams/status", "/api/streams/status/"], async (req, res) => {
+  try {
+    const activeStreams = Array.from(streamSlots.holders).map(id => {
+      const cam = cameras.find(c => c.id === id);
+      return {
+        cameraId: id,
+        cameraName: cam?.name || "Unknown",
+        clientCount: cameraStreams.get(id)?.size || 0,
+        restartCount: cameraRestartCounts.get(id) || 0,
+      };
+    });
+
+    const queuedStreams = pendingStreamQueue.map(id => {
+      const cam = cameras.find(c => c.id === id);
+      return {
+        cameraId: id,
+        cameraName: cam?.name || "Unknown",
+        waitingSince: queueTimestamps.get(id) || null,
+        waitingMs: Date.now() - (queueTimestamps.get(id) || Date.now()),
+      };
+    });
+
+    res.json({
+      config: {
+        maxConcurrent: MAX_CONCURRENT_STREAMS,
+        maxRestarts: MAX_RESTARTS_PER_CAMERA,
+        rotationIntervalMs: SLOT_ROTATION_INTERVAL_MS,
+      },
+      stats: {
+        activeCount: streamSlots.count,
+        queuedCount: pendingStreamQueue.length,
+        totalCameras: cameras.length,
+        activeCameras: cameras.filter(c => c.is_active).length,
+      },
+      activeStreams,
+      queuedStreams,
+      rotationEnabled: rotationInterval !== null,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/streams/status", method: "GET" });
     res.status(500).json({ detail: "Internal server error" });
   }
 });
@@ -4369,6 +4456,7 @@ async function persistAndBroadcastEvent(e: {
   guestId?: number | null;
   event_type: string;
   confidence: number;
+  threshold?: number;
   snapshot_path: string;
   person_name?: string;
   person_category?: string;
@@ -4476,19 +4564,20 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
    }
    const person = idx >= 0 ? persons[idx] : undefined;
 
-   await persistAndBroadcastEvent({
-     cameraId: cam.id,
-     cameraName: cam.name,
-     personId: match.personId,
-     event_type,
-     confidence,
-     snapshot_path,
-     person_name: match.personName,
-     person_category: match.category,
-     person_photo_path: person?.photo_path,
-     needs_operator_confirmation: !meetsVerification,
-     confirmation_status: !meetsVerification ? "pending" : undefined,
-   });
+    await persistAndBroadcastEvent({
+      cameraId: cam.id,
+      cameraName: cam.name,
+      personId: match.personId,
+      event_type,
+      confidence,
+      threshold: recognition_threshold_pct / 100,
+      snapshot_path,
+      person_name: match.personName,
+      person_category: match.category,
+      person_photo_path: person?.photo_path,
+      needs_operator_confirmation: !meetsVerification,
+      confirmation_status: !meetsVerification ? "pending" : undefined,
+    });
 
    triggerSmartRecording(cam);
  }
@@ -4772,6 +4861,134 @@ const cameraFrames = new Map<number, { frame: string; faces: any[]; dropped: num
 // Stream settings per camera (in-memory, DB schema deferred)
 const streamSettings = new Map<number, { row1: any; row2: any }>();
 const cameraZoneCache = new Map<number, { zones: any[]; exclusionZones: any[] }>();
+
+/** Максимальное количество одновременных активных FFmpeg-потоков.
+ *  Камеры Hikvision/UNV часто имеют лимит 2-3 RTSP-сессии.
+ *  При превышении лимита новые камеры получают последний сохранённый кадр
+ *  (или заглушку), пока не освободится слот. */
+const MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_CONCURRENT_STREAMS || "3", 10);
+
+/** Лимит перезапусков FFmpeg на одну камеру до принудительного освобождения слота. */
+const MAX_RESTARTS_PER_CAMERA = parseInt(process.env.MAX_RESTARTS_PER_CAMERA || "3", 10);
+
+/** Интервал ротации слотов (мс) — предотвращает голодание камер в очереди. */
+const SLOT_ROTATION_INTERVAL_MS = parseInt(process.env.SLOT_ROTATION_INTERVAL_MS || "30000", 10);
+
+// ── Атомарный менеджер слотов (предотвращает race conditions) ──
+const streamSlots = {
+  count: 0,
+  holders: new Set<number>(),
+
+  tryAcquire(cameraId: number): boolean {
+    if (this.holders.has(cameraId)) return true;
+    if (this.count >= MAX_CONCURRENT_STREAMS) return false;
+    this.count++;
+    this.holders.add(cameraId);
+    logDebug(`[StreamSlots] Camera ${cameraId} acquired slot (${this.count}/${MAX_CONCURRENT_STREAMS})`);
+    return true;
+  },
+
+  release(cameraId: number): boolean {
+    if (!this.holders.has(cameraId)) return false;
+    this.holders.delete(cameraId);
+    this.count = Math.max(0, this.count - 1);
+    logDebug(`[StreamSlots] Camera ${cameraId} released slot (${this.count}/${MAX_CONCURRENT_STREAMS})`);
+    return true;
+  },
+
+  getOldestHolder(): number | null {
+    const holders = Array.from(this.holders);
+    if (holders.length === 0) return null;
+    return holders[0];
+  },
+
+  isHolder(cameraId: number): boolean {
+    return this.holders.has(cameraId);
+  },
+};
+
+// ── Очередь ожидания ──
+const pendingStreamQueue: number[] = [];
+const queueTimestamps = new Map<number, number>();
+const cameraRestartCounts = new Map<number, number>();
+
+function activeStreamCount(): number {
+  return streamSlots.count;
+}
+
+function enqueueStream(cameraId: number): void {
+  if (!pendingStreamQueue.includes(cameraId)) {
+    pendingStreamQueue.push(cameraId);
+    queueTimestamps.set(cameraId, Date.now());
+    logInfo(`[StreamQueue] Camera ${cameraId} enqueued (position: ${pendingStreamQueue.length})`);
+  }
+}
+
+function dequeueAndStartNext(): void {
+  while (pendingStreamQueue.length > 0 && streamSlots.count < MAX_CONCURRENT_STREAMS) {
+    const nextId = pendingStreamQueue.shift()!;
+    queueTimestamps.delete(nextId);
+
+    const cam = cameras.find(c => c.id === nextId);
+    if (!cam || !cam.is_active) {
+      logDebug(`[StreamQueue] Camera ${nextId} no longer active, skipping`);
+      continue;
+    }
+
+    if (!streamSlots.tryAcquire(nextId)) break;
+
+    logInfo(`[StreamQueue] Camera ${nextId} dequeued, starting pipeline`);
+    startCameraPipeline(cam, getFallbackFrame());
+    return;
+  }
+}
+
+// ── Ротация слотов (предотвращает starvation) ──
+let rotationInterval: NodeJS.Timeout | null = null;
+
+function startSlotRotation(): void {
+  if (rotationInterval) return;
+
+  rotationInterval = setInterval(() => {
+    if (pendingStreamQueue.length === 0) return;
+    if (streamSlots.count < MAX_CONCURRENT_STREAMS) return;
+
+    const oldestId = streamSlots.getOldestHolder();
+    if (oldestId === null) return;
+
+    const cam = cameras.find(c => c.id === oldestId);
+    if (!cam) return;
+
+    logInfo(`[StreamRotation] Rotating camera ${oldestId} (${cam.name}) to give queued cameras a chance`);
+
+    stopCameraPipeline(oldestId);
+    enqueueStream(oldestId);
+
+    broadcastToCameraClients(oldestId, {
+      type: "STREAM_QUEUED",
+      cameraId: oldestId,
+      position: pendingStreamQueue.length,
+      queueLength: pendingStreamQueue.length,
+      message: "Слот передан другой камере, ожидание...",
+    });
+  }, SLOT_ROTATION_INTERVAL_MS);
+
+  logInfo(`[StreamRotation] Started (interval: ${SLOT_ROTATION_INTERVAL_MS}ms)`);
+}
+
+function broadcastToCameraClients(cameraId: number, message: any): void {
+  const streams = cameraStreams.get(cameraId);
+  if (!streams) return;
+
+  const payload = JSON.stringify(message);
+  for (const ws of streams) {
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+      }
+    } catch { /* ignore */ }
+  }
+}
 // Bounded очередь кадров для AI detection: дробим поток (25 FPS) от AI (10-12 FPS)
 // Когда очередь переполнена — выбрасываем старый кадр (FIFO), AI всегда видит свежий
 const AI_QUEUE_MAX = 3;
@@ -4913,9 +5130,27 @@ wssCamera.on("connection", (ws, req) => {
   // Кадр-заглушка, если реального потока ещё нет
   const fallbackFrame = getFallbackFrame();
 
-  // Запускаем FFmpeg + детекцию, если это первый клиент для этой камеры
+  // Запускаем FFmpeg + детекцию, если это первый клиент для этой камеры.
+  // Если достигнут лимит — ставим в очередь с уведомлением клиента.
   if (!activeFfmpegProcesses.has(cameraId)) {
-    startCameraPipeline(initialCam, fallbackFrame);
+    if (streamSlots.tryAcquire(cameraId)) {
+      ws.send(JSON.stringify({
+        type: "STREAM_STARTED",
+        cameraId,
+        message: "Поток запущен",
+      }));
+      startCameraPipeline(initialCam, fallbackFrame);
+    } else {
+      enqueueStream(cameraId);
+      ws.send(JSON.stringify({
+        type: "STREAM_QUEUED",
+        cameraId,
+        position: pendingStreamQueue.indexOf(cameraId) + 1,
+        queueLength: pendingStreamQueue.length,
+        message: `Ожидание свободного слота FFmpeg (${pendingStreamQueue.length} в очереди)...`,
+      }));
+      ws.send(fallbackFrame);
+    }
   }
 
   // Отправляем клиенту общий кадр камеры (обновляется единым конвейером)
@@ -4952,7 +5187,7 @@ wssCamera.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => {
+ws.on("close", () => {
     clearInterval(intervalId);
     const streams = cameraStreams.get(cameraId);
     if (streams) {
@@ -4961,6 +5196,12 @@ wssCamera.on("connection", (ws, req) => {
       if (streams.size === 0) {
         stopCameraPipeline(cameraId);
       }
+    }
+    // Убираем камеру из очереди, если она там ещё ждёт
+    const qIdx = pendingStreamQueue.indexOf(cameraId);
+    if (qIdx >= 0) {
+      pendingStreamQueue.splice(qIdx, 1);
+      queueTimestamps.delete(cameraId);
     }
   });
 });
@@ -4979,7 +5220,10 @@ function getFallbackFrame(): string {
 }
 
 function startCameraPipeline(cam: any, fallbackFrame: string) {
-  if (!cam.source) return;
+  if (!cam.source) {
+    streamSlots.release(cam.id);
+    return;
+  }
 
   const args = [
     ...buildFfmpegInputArgs(cam),
@@ -5125,25 +5369,46 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         cb.reason = reason;
       }
 
-      const delay = Math.min(30000, 3000 * 2 ** Math.min(attempts - 1, 4));
-      // Логируем не каждую попытку, чтобы не засорять лог при долгой недоступности
-      if (attempts === 1 || attempts % 5 === 0) {
-        logWarn(`Камера ${cam.id} (${cam.name}) недоступна, попытка №${attempts}/${MAX_RESTART_ATTEMPTS}, следующий повтор через ${delay / 1000}с. Причина: ${reason}`);
-      }
+const delay = Math.min(30000, 3000 * 2 ** Math.min(attempts - 1, 4));
+       // Логируем не каждую попытку, чтобы не засорять лог при долгой недоступности
+       if (attempts === 1 || attempts % 5 === 0) {
+         logWarn(`Камера ${cam.id} (${cam.name}) недоступна, попытка №${attempts}/${MAX_RESTART_ATTEMPTS}, следующий повтор через ${delay / 1000}с. Причина: ${reason}`);
+       }
 
-      const restartTimer = setTimeout(() => {
-        cameraRestartTimers.delete(cam.id);
-        const latestCam = cameras.find(c => c.id === cam.id);
-        const stillHasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
-        if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(cam.id)) {
-          startCameraPipeline(latestCam, fallbackFrame);
-        }
-      }, delay);
+       const restartTimer = setTimeout(() => {
+         cameraRestartTimers.delete(cam.id);
+         const latestCam = cameras.find(c => c.id === cam.id);
+         const stillHasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
+         if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(cam.id)) {
+           const restarts = (cameraRestartCounts.get(cam.id) || 0) + 1;
+           cameraRestartCounts.set(cam.id, restarts);
+
+           if (restarts >= MAX_RESTARTS_PER_CAMERA) {
+             logWarn(`[Stream] Camera ${cam.id} (${cam.name}) exceeded max restarts (${MAX_RESTARTS_PER_CAMERA}), releasing slot`);
+             streamSlots.release(cam.id);
+             cameraRestartCounts.delete(cam.id);
+             broadcastToCameraClients(cam.id, {
+               type: "STREAM_FAILED",
+               cameraId: cam.id,
+               message: `Камера недоступна после ${MAX_RESTARTS_PER_CAMERA} попыток. Проверьте RTSP URL/credentials.`,
+             });
+             return;
+           }
+
+           if (streamSlots.tryAcquire(cam.id)) {
+             startCameraPipeline(latestCam, fallbackFrame);
+           } else {
+             streamSlots.release(cam.id);
+             enqueueStream(cam.id);
+           }
+         }
+       }, delay);
       cameraRestartTimers.set(cam.id, restartTimer);
     });
 
     startCameraDetection(cam, fallbackFrame);
   } catch (e: any) {
+    streamSlots.release(cam.id);
     logError(`Не удалось запустить FFmpeg: ${e.message}`);
   }
 }
@@ -5234,6 +5499,11 @@ function stopCameraPipeline(cameraId: number) {
   cameraFrameQueues.delete(cameraId);
   cameraFrames.delete(cameraId);
   cameraSessionIds.delete(cameraId);
+  cameraRestartCounts.delete(cameraId);
+  streamSlots.release(cameraId);
+
+  // Освободился слот — запускаем следующую камеру из очереди
+  dequeueAndStartNext();
 }
 
 // Upgrade handling for websockets

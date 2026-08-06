@@ -860,6 +860,7 @@ function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: 
   const [personDetails, setPersonDetails] = useState<Person | null>(null)
   const [categoryAlert, setCategoryAlert] = useState<string | null>(null)
   const prevCategoryRef = useRef<string | null>(null)
+  const [lightboxPhoto, setLightboxPhoto] = useState<string | null>(null)
 
   useEffect(() => {
     if (!person?.id) { setLoyalty(null); setPersonDetails(null); setCategoryAlert(null); prevCategoryRef.current = null; return }
@@ -869,7 +870,6 @@ function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: 
     apiFetch<Person>(`/persons/${person.id}`)
       .then(p => {
         setPersonDetails(p)
-        // Detect category change
         const prevCat = prevCategoryRef.current
         const currCat = p.category
         if (prevCat && prevCat !== currCat) {
@@ -880,6 +880,17 @@ function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: 
       })
       .catch(() => setPersonDetails(null))
   }, [person?.id])
+
+  useEffect(() => {
+    if (!lightboxPhoto) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setLightboxPhoto(null) }
+    document.addEventListener('keydown', onKey)
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = ''
+    }
+  }, [lightboxPhoto])
 
   const display = personDetails ?? person
   const lastVisit = personDetails?.last_seen_at ?? null
@@ -920,12 +931,15 @@ function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: 
 
       {/* Фото + имя */}
       <div className="flex items-center gap-3">
-        <div className="w-24 h-24 rounded-xl overflow-hidden bg-kraken-hover border-2 flex-shrink-0"
-          style={{ borderColor: confColor }}>
+        <button
+          onClick={() => setLightboxPhoto(person.photo_path ? `${PHOTO_BASE}/${person.photo_path}` : null)}
+          className="w-24 h-24 rounded-xl overflow-hidden bg-kraken-hover border-2 flex-shrink-0 hover:opacity-80 transition-opacity"
+          style={{ borderColor: confColor }}
+        >
           {person.photo_path
             ? <img src={`${PHOTO_BASE}/${person.photo_path}`} alt="" className="w-full h-full object-cover" />
             : <div className="w-full h-full flex items-center justify-center text-3xl">👤</div>}
-        </div>
+        </button>
         <div className="flex-1 min-w-0">
           <div className="text-kraken-text font-bold text-sm truncate">{display?.name ?? person.name}</div>
           <CategoryBadge category={display?.category ?? person.category} />
@@ -945,19 +959,25 @@ function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: 
       {/* До/После фото */}
       {onPhoto && (
         <div className="flex gap-2">
-          <div className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
+          <button
+            onClick={() => setLightboxPhoto(onPhoto.startsWith('data:image') ? onPhoto : `${PHOTO_BASE}/${onPhoto}`)}
+            className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border hover:opacity-80 transition-opacity"
+          >
             <div className="text-kraken-disabled text-[9px] text-center py-1 border-b border-kraken-border">Сейчас</div>
             <img 
               src={onPhoto.startsWith('data:image') ? onPhoto : `${PHOTO_BASE}/${onPhoto}`} 
               alt="current" 
               className="w-full h-20 object-cover" 
             />
-          </div>
+          </button>
           {person.photo_path && (
-            <div className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
+            <button
+              onClick={() => setLightboxPhoto(`${PHOTO_BASE}/${person.photo_path}`)}
+              className="flex-1 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border hover:opacity-80 transition-opacity"
+            >
               <div className="text-kraken-disabled text-[9px] text-center py-1 border-b border-kraken-border">Профиль</div>
               <img src={`${PHOTO_BASE}/${person.photo_path}`} alt="profile" className="w-full h-20 object-cover" />
-            </div>
+            </button>
           )}
         </div>
       )}
@@ -1020,6 +1040,27 @@ function LastGuestBlock({ person, confidence, cameraName, threshold, onPhoto }: 
           </div>
         )}
       </div>
+
+      {/* Lightbox */}
+      {lightboxPhoto && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+          onClick={() => setLightboxPhoto(null)}
+        >
+          <button
+            onClick={() => setLightboxPhoto(null)}
+            className="absolute top-4 right-4 text-white/80 hover:text-white text-2xl font-bold w-10 h-10 flex items-center justify-center"
+          >
+            ✕
+          </button>
+          <img
+            src={lightboxPhoto}
+            alt=""
+            className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg shadow-2xl"
+            onClick={e => e.stopPropagation()}
+          />
+        </div>
+      )}
     </div>
   )
 }
